@@ -2,15 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"time"
 
 	"cloud.google.com/go/bigquery"
+	googleapi "google.golang.org/api/googleapi"
 
 	"github.com/munnerz/quayio-bq-exporter/internal"
 )
@@ -26,6 +24,7 @@ var (
 	namespace, repository string
 
 	projectID, dataset, table string
+	create                    bool
 )
 
 func init() {
@@ -37,88 +36,7 @@ func init() {
 	flag.StringVar(&projectID, "project-id", "", "the project ID for the bigquery dataset")
 	flag.StringVar(&dataset, "dataset", "", "the bigquery dataset name to write to")
 	flag.StringVar(&table, "table", "", "the bigquery table id to write to")
-}
-
-func buildRequest(nextPage string) (*http.Request, error) {
-	values := make(url.Values)
-	values["starttime"] = []string{startDate}
-	values["endtime"] = []string{endDate}
-	if nextPage != "" {
-		values["next_page"] = []string{nextPage}
-	}
-	reqURL := url.URL{
-		Scheme:   "https",
-		Host:     "quay.io",
-		Path:     fmt.Sprintf(repoLogsFormat, namespace, repository),
-		RawQuery: values.Encode(),
-	}
-	log.Printf("Building request URL %q", reqURL.String())
-	req, err := http.NewRequest("GET", reqURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", authToken))
-
-	return req, nil
-}
-
-func getLogs(cl *http.Client, nextPage string) (*internal.GetLogsResponse, error) {
-	req, err := buildRequest(nextPage)
-	if err != nil {
-		return nil, err
-	}
-	failures := 0
-	for {
-		resp, err := cl.Do(req)
-		if err != nil {
-			failures++
-			if failures == 3 {
-				return nil, err
-			}
-			log.Printf("HTTP request to quay.io failed, will retry: %v", err)
-			time.Sleep(time.Second * 5)
-			continue
-		}
-		// TODO: should this be run irrespective of err != nil?
-		defer resp.Body.Close()
-		logs := &internal.GetLogsResponse{}
-
-		decoder := json.NewDecoder(resp.Body)
-		err = decoder.Decode(logs)
-		if err != nil {
-			return nil, err
-		}
-		return logs, nil
-	}
-}
-
-func getAllLogs() <-chan []internal.LogEntry {
-	out := make(chan []internal.LogEntry)
-	go func() {
-		defer close(out)
-		cl := http.DefaultClient
-		logs, err := getLogs(cl, "")
-		if err != nil {
-			log.Fatalf("error getting logs: %v", err)
-			return
-		}
-		log.Printf("Geting logs between %v and %v", logs.StartTime, logs.EndTime)
-		out <- logs.Logs
-		for {
-			if logs.NextPage == "" {
-				break
-			}
-
-			nextLogs, err := getLogs(cl, logs.NextPage)
-			if err != nil {
-				log.Fatalf("error getting logs: %v", err)
-				return
-			}
-			out <- logs.Logs
-			logs.NextPage = nextLogs.NextPage
-		}
-	}()
-	return out
+	flag.BoolVar(&create, "create", true, "create bigquery table if it does not exist")
 }
 
 func main() {
@@ -141,6 +59,14 @@ func main() {
 	if table == "" {
 		log.Fatalf("-table must be specified")
 	}
+	start, err := time.Parse(dateParamFormat, startDate)
+	if err != nil {
+		log.Fatalf("error parsing start date: %v", err)
+	}
+	end, err := time.Parse(dateParamFormat, endDate)
+	if err != nil {
+		log.Fatalf("error parsing end date: %v", err)
+	}
 
 	ctx := context.Background()
 	client, err := bigquery.NewClient(ctx, projectID)
@@ -148,11 +74,34 @@ func main() {
 		log.Fatalf("error creating bigquery client: %v", err)
 	}
 
-	uploader := client.Dataset(dataset).Table(table).Uploader()
-	logsChan := getAllLogs()
-	for logs := range logsChan {
-		log.Printf("Got %d logs", len(logs))
-		err := uploader.Put(ctx, logs)
+	table := client.Dataset(dataset).Table(table)
+	_, err = table.Metadata(ctx)
+	if err != nil {
+		err, ok := err.(*googleapi.Error)
+		if !ok || !create {
+			log.Fatalf("unexpected error: %v", err)
+		}
+		if err.Code == http.StatusNotFound {
+			schema, err := bigquery.InferSchema(&internal.LogEntry{})
+			if err != nil {
+				log.Fatalf("error inferring bigquery schema: %v", err)
+			}
+			err = table.Create(ctx, &bigquery.TableMetadata{
+				Schema:         schema,
+				UseStandardSQL: true,
+				UseLegacySQL:   false,
+			})
+			if err != nil {
+				log.Fatalf("error creating table: %v", err)
+			}
+		}
+	}
+
+	grabber := internal.NewLogsGrabber(http.DefaultClient, namespace, repository, authToken)
+	logsChan := grabber.ForDateRange(start, end)
+	// TODO: buffer results before writing to sink
+	for l := range logsChan {
+		err := table.Uploader().Put(ctx, l)
 		if err != nil {
 			multiError, ok := err.(bigquery.PutMultiError)
 			if ok {

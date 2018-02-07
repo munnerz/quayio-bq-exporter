@@ -102,8 +102,8 @@ type LogEntryIP struct {
 	SyncToken string `json:"sync_token"`
 	Region    string `json:"region"`
 	// todo: not sure what type this field is
-	Service  json.RawMessage `json:"service"`
-	Provider string          `json:"provider"`
+	// Service  json.RawMessage `json:"service"`
+	Provider string `json:"provider"`
 }
 
 type EntryKind string
