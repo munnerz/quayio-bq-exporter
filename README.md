@@ -8,7 +8,7 @@ for analysis.
 Release binaries are not published. To install, use `go get`:
 
 ```
-$ go get github.com/munnerz/quayio-bg-exporter
+$ go get github.com/munnerz/quayio-bq-exporter
 ```
 
 ## Usage
@@ -17,10 +17,14 @@ $ go get github.com/munnerz/quayio-bg-exporter
 Usage of quayio-bq-exporter:
   -auth-token string
     	quay.io api bearer token to use for requests
+  -bucket string
+    	the GCS bucket name to store exports in (default "quayio-log-exports")
+  -create
+    	create bigquery table if it does not exist (default true)
   -dataset string
     	the bigquery dataset name to write to
   -end string
-    	end date to gather logs to (e.g. 01/02/2006) (default "02/07/2018")
+    	end date to gather logs to (e.g. 01/02/2006) (default "02/09/2018")
   -namespace string
     	quay.io repository namespace
   -project-id string
@@ -28,7 +32,7 @@ Usage of quayio-bq-exporter:
   -repo string
     	quay.io repository name
   -start string
-    	start date to gather logs from (e.g. 01/02/2006) (default "02/07/2018")
+    	start date to gather logs from (e.g. 01/02/2006) (default "02/09/2018")
   -table string
     	the bigquery table id to write to
 ```
