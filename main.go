@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/bigquery"
+	"cloud.google.com/go/storage"
 	googleapi "google.golang.org/api/googleapi"
 
 	"github.com/munnerz/quayio-bq-exporter/internal"
@@ -25,6 +28,8 @@ var (
 
 	projectID, dataset, table string
 	create                    bool
+
+	bucketName string
 )
 
 func init() {
@@ -37,6 +42,7 @@ func init() {
 	flag.StringVar(&dataset, "dataset", "", "the bigquery dataset name to write to")
 	flag.StringVar(&table, "table", "", "the bigquery table id to write to")
 	flag.BoolVar(&create, "create", true, "create bigquery table if it does not exist")
+	flag.StringVar(&bucketName, "bucket", "quayio-log-exports", "the GCS bucket name to store exports in")
 }
 
 func main() {
@@ -82,14 +88,8 @@ func main() {
 			log.Fatalf("unexpected error: %v", err)
 		}
 		if err.Code == http.StatusNotFound {
-			schema, err := bigquery.InferSchema(&internal.LogEntry{})
-			if err != nil {
-				log.Fatalf("error inferring bigquery schema: %v", err)
-			}
-			err = table.Create(ctx, &bigquery.TableMetadata{
-				Schema:         schema,
-				UseStandardSQL: true,
-				UseLegacySQL:   false,
+			err := table.Create(ctx, &bigquery.TableMetadata{
+				Schema: internal.LogEntrySchema,
 			})
 			if err != nil {
 				log.Fatalf("error creating table: %v", err)
@@ -97,19 +97,68 @@ func main() {
 		}
 	}
 
+	storageCl, err := storage.NewClient(ctx)
+	if err != nil {
+		log.Fatalf("error creating storage client: %v", err)
+	}
 	grabber := internal.NewLogsGrabber(http.DefaultClient, namespace, repository, authToken)
-	logsChan := grabber.ForDateRange(start, end)
-	// TODO: buffer results before writing to sink
-	for l := range logsChan {
-		err := table.Uploader().Put(ctx, l)
-		if err != nil {
-			multiError, ok := err.(bigquery.PutMultiError)
-			if ok {
-				for _, err := range multiError {
-					log.Printf("Insert error: %v", err.Error())
-				}
+	sink := internal.NewGCSSink(storageCl, bucketName, fmt.Sprintf("%s/%s", namespace, repository))
+	grabber.SetAlreadyExistsFunc(sink.Exists)
+	logChans := grabber.ForDateRange(start, end)
+	var wg sync.WaitGroup
+	wg.Add(len(logChans))
+	for date, ch := range logChans {
+		go func(date time.Time, ch <-chan *internal.LogEntry) {
+			// this will be called twice in the success case, but that's okay
+			defer sink.Close(date)
+			defer wg.Done()
+			err := sinkChan(ch, sink)
+			if err != nil {
+				log.Fatalf("error writing log entry: %v", err)
 			}
-			log.Fatalf("error writing logs to bigquery: %v", err)
+			err = sink.Close(date)
+			if err != nil {
+				log.Fatalf("error saving file to gcs: %v", err)
+			}
+		}(date, ch)
+	}
+
+	wg.Wait()
+	var refs []string
+	for d, _ := range logChans {
+		exists, ref, err := sink.Exists(d)
+		if err != nil {
+			log.Fatalf("error checking if data file exists: %v", err)
+		}
+		if !exists {
+			log.Printf("could not find data file for date %q", d)
+			continue
+		}
+		log.Printf("Loading data file %q", ref)
+		refs = append(refs, ref)
+	}
+
+	gcsRef := bigquery.NewGCSReference(refs...)
+	gcsRef.AutoDetect = true
+	gcsRef.FileConfig = bigquery.FileConfig{
+		SourceFormat: bigquery.JSON,
+	}
+	loader := table.LoaderFrom(gcsRef)
+	job, err := loader.Run(ctx)
+	if err != nil {
+		log.Fatalf("Erroring running import job: %v", err)
+	}
+	_, err = job.Wait(ctx)
+	if err != nil {
+		log.Fatalf("Error waiting for import job to complete: %v", err)
+	}
+}
+
+func sinkChan(ch <-chan *internal.LogEntry, sink *internal.GCSSink) error {
+	for e := range ch {
+		if err := sink.Write(e); err != nil {
+			return err
 		}
 	}
+	return nil
 }

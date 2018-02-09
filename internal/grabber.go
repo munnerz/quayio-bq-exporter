@@ -19,31 +19,57 @@ const (
 type LogsGrabber struct {
 	cl                  *http.Client
 	ns, repo, authToken string
+	alreadyExists       alreadyExistsFunc
+}
+
+func defaultFalseAlreadyExistsFunc(time.Time) (bool, string, error) {
+	return false, "", nil
 }
 
 func NewLogsGrabber(cl *http.Client, ns, repo, authToken string) *LogsGrabber {
-	return &LogsGrabber{cl, ns, repo, authToken}
+	return &LogsGrabber{cl, ns, repo, authToken, defaultFalseAlreadyExistsFunc}
 }
 
-func (l *LogsGrabber) ForDateRange(start, end time.Time) <-chan *LogEntry {
+func (l *LogsGrabber) SetAlreadyExistsFunc(s alreadyExistsFunc) {
+	l.alreadyExists = s
+}
+
+func (l *LogsGrabber) ForDateRange(start, end time.Time) map[time.Time]chan *LogEntry {
 	return l.performPerDayRequest(start, end)
 }
 
-func (l *LogsGrabber) performPerDayRequest(start, end time.Time) <-chan *LogEntry {
-	out := make(chan *LogEntry)
+func (l *LogsGrabber) performPerDayRequest(start, end time.Time) map[time.Time]chan *LogEntry {
+	out := map[time.Time]chan *LogEntry{}
+	dates := []time.Time{}
+	for i := 0; ; i++ {
+		if end.Before(start) {
+			break
+		}
+		d := start
+		start = start.Add(time.Hour * 24)
+		exists, _, err := l.alreadyExists(d)
+		if err != nil {
+			log.Printf("error checking if data already exists for date %q: %v", d.Format(dateFormat), err)
+			continue
+		}
+		if exists {
+			log.Printf("skipping day %q as it already exists in storage sink", d.Format(dateFormat))
+			continue
+		}
+		dates = append(dates, d)
+		out[d] = make(chan *LogEntry)
+	}
 	go func() {
-		defer close(out)
-		for {
-			if end.Before(start) {
-				break
-			}
-
-			// get all logs for the single day 'start'
-			respCh := l.getAllLogsForRange(start, start)
-			for r := range respCh {
-				out <- r
-			}
-			start = start.Add(time.Hour * 24)
+		for _, d := range dates {
+			func() {
+				out := out[d]
+				defer close(out)
+				// get all logs for the single day 'start'
+				respCh := l.getAllLogsForRange(d, d)
+				for r := range respCh {
+					out <- r
+				}
+			}()
 		}
 	}()
 	return out
